@@ -39,7 +39,7 @@ Base.metadata.create_all(bind=engine)
 
 # --- CONFIGURAÇÃO DE ALERTA REAL ---
 # IMPORTANTE: Substitua o link abaixo pelo seu link gerado no Webhook.site
-WEBHOOK_URL = "URL_DO_SEU_WEBHOOK"
+WEBHOOK_URL = "https://webhook.site/01357d1f-0b8a-4527-884f-41579b128943"
 
 async def disparar_alerta_urgente(telefone, distancia, vitima):
     """Envia um alerta real para uma central externa via Webhook"""

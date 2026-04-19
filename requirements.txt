@@ -3,3 +3,4 @@ uvicorn
 geopy
 sqlalchemy
 python-multipart
+httpx

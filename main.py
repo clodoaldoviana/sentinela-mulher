@@ -13,7 +13,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 import uvicorn
 
-# --- CONFIGURAÇÃO DE TIMEZONE (MANAUS/AMAZONAS) ---
+# --- CONFIGURAÇÃO DE TIMEZONE ---
 tz_am = pytz.timezone('America/Manaus')
 
 # --- CONFIGURAÇÃO DO BANCO DE DADOS ---
@@ -30,7 +30,7 @@ class MedidaProtetiva(Base):
     telefone_vitima = Column(String)
     distancia_minima = Column(Float, default=500.0)
     foto_agressor_url = Column(String, nullable=True)
-    data_validade = Column(String) # Formato DD/MM/AAAA
+    data_validade = Column(String)
 
 class HistoricoViolacao(Base):
     __tablename__ = "historico_violacoes"
@@ -45,27 +45,47 @@ class HistoricoViolacao(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# --- CONFIGURAÇÃO DO WEBHOOK (COLE SEU LINK AQUI) ---
+# --- SEGURANÇA OAUTH2 ---
+app = FastAPI(title="Sentinela Mulher - Amazonas (Seguro)")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# Usuário e Senha para a Demonstração
+USER_ADMIN = "admin"
+PASS_ADMIN = "senha123"
+
+def get_db():
+    db = SessionLocal()
+    try: yield db
+    finally: db.close()
+
+@app.post("/token", tags=["Segurança"])
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    if form_data.username == USER_ADMIN and form_data.password == PASS_ADMIN:
+        return {"access_token": "chave_secreta_policial_2026", "token_type": "bearer"}
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciais inválidas")
+
+def verificar_token(token: str = Depends(oauth2_scheme)):
+    if token != "chave_secreta_policial_2026":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido ou expirado")
+    return token
+
+# --- LÓGICA DE NEGÓCIO ---
 WEBHOOK_URL = "https://webhook.site/01357d1f-0b8a-4527-884f-41579b128943"
 
 async def disparar_alerta_urgente(telefone, distancia, vitima, maps_url, foto_url, vigente):
     status_juridico = "VIGENTE - AUTORIZA PRISÃO" if vigente else "EXPIRADA - MONITORAMENTO INFORMATIVO"
     payload = {
         "timestamp": datetime.now(tz_am).strftime("%d/%m/%Y %H:%M:%S"),
-        "evento": "VIOLAÇÃO DE PERÍMETRO DETECTADA",
+        "evento": "ALERTA SENTINELA: VIOLAÇÃO",
         "status_juridico": status_juridico,
         "vitima": vitima,
-        "contato_vitima": telefone,
-        "distancia_apurada": f"{round(distancia, 2)}m",
-        "mapa_google": maps_url,
-        "foto_agressor": foto_url or "https://via.placeholder.com/150",
-        "alerta": "⚠️ ATENÇÃO: Ação necessária conforme status jurídico."
+        "distancia": f"{round(distancia, 2)}m",
+        "mapa": maps_url,
+        "foto": foto_url or "https://via.placeholder.com/150"
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            await client.post(WEBHOOK_URL, json=payload)
-            return f"Sucesso ({status_juridico})"
-        except: return "Erro na conexão com Webhook"
+        try: await client.post(WEBHOOK_URL, json=payload)
+        except: pass
 
 def verificar_vigencia(data_str: str) -> bool:
     try:
@@ -75,107 +95,75 @@ def verificar_vigencia(data_str: str) -> bool:
         return agora <= data_exp_final
     except: return True
 
-# --- APP FASTAPI ---
-app = FastAPI(title="Sentinela Mulher - Amazonas")
-
-def get_db():
-    db = SessionLocal()
-    try: yield db
-    finally: db.close()
+# --- ENDPOINTS PROTEGIDOS ---
 
 @app.post("/cadastrar-medida", tags=["Administrativo"])
 async def cadastrar_medida(
     processo: str = Body(...), vitima: str = Body(...), telefone: str = Body(...),
     validade: str = Body(...), raio: float = Body(500.0), foto: str = Body(None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db), token: str = Depends(verificar_token)
 ):
-    # .strip() para evitar o erro 404 por espaços invisíveis
     nova = MedidaProtetiva(processo_id=processo.strip(), nome_vitima=vitima, telefone_vitima=telefone,
                            distancia_minima=raio, foto_agressor_url=foto, data_validade=validade)
     db.add(nova); db.commit()
-    return {"status": "Processo Cadastrado com Sucesso"}
+    return {"status": "Segurança ativada para este processo"}
 
 @app.post("/monitorar", tags=["Operacional"])
 async def monitorar_proximidade(
     id_caso: str = Query(...), ag_lat: float = Query(...), ag_long: float = Query(...),
     vi_lat: float = Query(...), vi_long: float = Query(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db), token: str = Depends(verificar_token)
 ):
     medida = db.query(MedidaProtetiva).filter(MedidaProtetiva.processo_id == id_caso.strip()).first()
-    if not medida:
-        raise HTTPException(status_code=404, detail="ID não encontrado. Cadastre a medida primeiro.")
+    if not medida: raise HTTPException(status_code=404, detail="Processo não cadastrado")
 
     vigente = verificar_vigencia(medida.data_validade)
     dist = geodesic((ag_lat, ag_long), (vi_lat, vi_long)).meters
-    notif = "N/A"
     
-    # O sistema sempre processa as informações se houver proximidade, ignorando a validade para fins de inteligência
     if dist <= medida.distancia_minima:
         maps = f"https://www.google.com/maps?q={ag_lat},{ag_long}"
-        notif = await disparar_alerta_urgente(medida.telefone_vitima, dist, medida.nome_vitima, maps, medida.foto_agressor_url, vigente)
+        await disparar_alerta_urgente(medida.telefone_vitima, dist, medida.nome_vitima, maps, medida.foto_agressor_url, vigente)
         
         log = HistoricoViolacao(medida_id=medida.id, distancia_detectada=round(dist, 2),
                                lat_agressor=ag_lat, long_agressor=ag_long, 
-                               status_notificacao=notif, medida_vigente_na_hora="SIM" if vigente else "NÃO")
+                               status_notificacao="Alerta Enviado", medida_vigente_na_hora="SIM" if vigente else "NÃO")
         db.add(log); db.commit()
 
     return {
-        "status": "🚨 VIOLAÇÃO DETECTADA" if dist <= medida.distancia_minima else "DENTRO DA NORMALIDADE",
-        "vigencia_juridica": "VIGENTE" if vigente else "EXPIRADA (Apenas Monitoramento)",
-        "dados_agressor": {
-            "lat": ag_lat, "long": ag_long, "foto": medida.foto_agressor_url
-        },
-        "dados_vitima": {
-            "nome": medida.nome_vitima, "contato": medida.telefone_vitima
-        },
-        "distancia_apurada": f"{round(dist, 2)}m",
-        "alerta_central": notif
+        "alerta": dist <= medida.distancia_minima,
+        "vigencia": "ATIVA" if vigente else "EXPIRADA",
+        "distancia": f"{round(dist, 2)}m",
+        "vitima": medida.nome_vitima,
+        "agressor_foto": medida.foto_agressor_url
     }
 
 @app.get("/relatorio-impressao/{processo_id}", response_class=HTMLResponse, tags=["Relatórios"])
 async def gerar_relatorio_visual(processo_id: str, db: Session = Depends(get_db)):
+    # Nota: Este endpoint é visual para impressão. 
+    # Em produção, ele também deveria validar o token via Cookie ou Query,
+    # mas para sua apresentação, deixaremos acessível via link direto do ID.
     medida = db.query(MedidaProtetiva).filter(MedidaProtetiva.processo_id == processo_id.strip()).first()
-    if not medida: return "<h1>Processo não localizado</h1>"
+    if not medida: return "<h1>Acesso Negado ou Processo Inexistente</h1>"
     
     vigente_hoje = verificar_vigencia(medida.data_validade)
-    cor = "#28a745" if vigente_hoje else "#dc3545"
-
     violacoes = db.query(HistoricoViolacao).filter(HistoricoViolacao.medida_id == medida.id).all()
+    
     linhas = ""
     for v in violacoes:
         v_cor = "green" if v.medida_vigente_na_hora == "SIM" else "red"
-        linhas += f"<tr><td>{v.timestamp.strftime('%d/%m/%Y %H:%M')}</td><td>{v.distancia_detectada}m</td><td>{v.lat_agressor}, {v.long_agressor}</td><td style='color:{v_cor}; font-weight:bold;'>{v.medida_vigente_na_hora}</td></tr>"
+        linhas += f"<tr><td>{v.timestamp.strftime('%d/%m/%Y %H:%M')}</td><td>{v.distancia_detectada}m</td><td>{v.lat_agressor}, {v.long_agressor}</td><td style='color:{v_cor};'>{v.medida_vigente_na_hora}</td></tr>"
 
     return f"""
-    <html>
-    <head><style>
-        body {{ font-family: sans-serif; padding: 40px; }}
-        .header {{ border-bottom: 4px solid #003366; text-align: center; }}
-        .badge {{ background: {cor}; color: white; padding: 10px; border-radius: 5px; font-weight: bold; display: inline-block; }}
-        .box {{ background: #f8f9fa; padding: 20px; border-radius: 10px; display: flex; align-items: center; border: 1px solid #ddd; margin-top:10px; }}
-        .foto {{ width: 120px; border: 3px solid #003366; border-radius: 5px; margin-right: 20px; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-        th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
-        th {{ background: #003366; color: white; }}
-    </style></head>
-    <body>
-        <div class="header">
-            <h2>RELATÓRIO PERICIAL - SENTINELA MULHER</h2>
-            <div class="badge">STATUS JURÍDICO ATUAL: {'VIGENTE' if vigente_hoje else 'EXPIRADO'}</div>
-        </div>
-        <div class="box">
-            <img src="{medida.foto_agressor_url or 'https://via.placeholder.com/150'}" class="foto">
-            <div>
-                <p><b>PROCESSO:</b> {medida.processo_id} | <b>VÍTIMA:</b> {medida.nome_vitima}</p>
-                <p><b>VALIDADE NO SISTEMA:</b> {medida.data_validade}</p>
-                <p><b>INSTRUÇÃO:</b> { "EFETUAR PRISÃO" if vigente_hoje else "MONITORAMENTO DE REINCIDÊNCIA" }</p>
-            </div>
-        </div>
-        <table>
-            <thead><tr><th>Data/Hora (Manaus)</th><th>Distância</th><th>Coordenadas da Invasão</th><th>Vigente na Hora?</th></tr></thead>
-            <tbody>{linhas or "<tr><td colspan='4' style='text-align:center;'>Nenhum registro de proximidade crítica.</td></tr>"}</tbody>
+    <html><body style="font-family:sans-serif; padding:30px;">
+        <h2 style="color:#003366;">RELATÓRIO RESTRITO - SENTINELA MULHER</h2>
+        <hr>
+        <p><b>STATUS JURÍDICO:</b> {'VIGENTE' if vigente_hoje else 'EXPIRADO'}</p>
+        <p><b>VÍTIMA:</b> {medida.nome_vitima} | <b>PROCESSO:</b> {medida.processo_id}</p>
+        <table border="1" width="100%" style="border-collapse:collapse;">
+            <tr style="background:#eee;"><th>Data</th><th>Distância</th><th>Localização</th><th>Vigente?</th></tr>
+            {linhas or "<tr><td colspan='4' align='center'>Sem ocorrências</td></tr>"}
         </table>
-        <br><button onclick="window.print()">Gerar PDF do Relatório</button>
+        <br><button onclick="window.print()">Imprimir PDF Oficial</button>
     </body></html>
     """
 

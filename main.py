@@ -38,37 +38,35 @@ class HistoricoViolacao(Base):
     lat_agressor = Column(Float)
     long_agressor = Column(Float)
     status_notificacao = Column(String)
-    medida_vigente_na_hora = Column(String) # "SIM" ou "NÃO" para resguardo jurídico
+    medida_vigente_na_hora = Column(String) # Resguardo jurídico para o policial
 
 Base.metadata.create_all(bind=engine)
 
 # --- CONFIGURAÇÃO DE ALERTA REAL ---
-# Substitua pelo seu link do Webhook.site para a demonstração
+# IMPORTANTE: Substitua pela sua URL do Webhook.site
 WEBHOOK_URL = "https://webhook.site/01357d1f-0b8a-4527-884f-41579b128943"
 
 async def disparar_alerta_urgente(telefone, distancia, vitima, maps_url, foto_url, vigente):
-    """Envia o Alerta Real com Status de Vigência Jurídica"""
     status_juridico = "VIGENTE - AUTORIZA PRISÃO" if vigente else "EXPIRADA - INFORMATIVO"
     payload = {
         "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         "evento": "VIOLAÇÃO DE PERÍMETRO",
         "status_juridico": status_juridico,
         "vitima": vitima,
-        "contato_vitima": telefone,
-        "distancia": f"{round(distancia, 2)} metros",
-        "mapa_localizacao": maps_url,
-        "foto_agressor": foto_url or "https://via.placeholder.com/150",
-        "mensagem": f"🚨 ALERTA SENTINELA: Invasão detectada a {round(distancia, 2)}m da vítima {vitima}."
+        "distancia": f"{round(distancia, 2)}m",
+        "mapa": maps_url,
+        "foto": foto_url or "https://via.placeholder.com/150",
+        "mensagem": f"🚨 ALERTA: Invasão detectada a {round(distancia, 2)}m de {vitima}."
     }
     async with httpx.AsyncClient() as client:
         try:
             await client.post(WEBHOOK_URL, json=payload)
-            return f"Alerta Disparado ({status_juridico})"
+            return f"Alerta Enviado ({status_juridico})"
         except:
-            return "Falha ao contactar Central"
+            return "Falha na Central de Alerta"
 
-# --- INICIALIZAÇÃO E SEGURANÇA ---
-app = FastAPI(title="Sentinela Mulher - Projeto Investigador Clodoaldo")
+# --- SEGURANÇA ---
+app = FastAPI(title="Sentinela Mulher - Amazonas")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 def get_db():
@@ -90,21 +88,15 @@ def verificar_token(token: str = Depends(oauth2_scheme)):
 
 @app.post("/cadastrar-medida", tags=["Administrativo"])
 async def cadastrar_medida(
-    processo: str = Body(..., example="2026-AM-001"),
-    vitima: str = Body(..., example="Maria da Silva"),
-    telefone: str = Body(..., example="5592999999999"),
-    validade: str = Body(..., example="31/12/2026", description="Data de validade DD/MM/AAAA"),
-    raio: float = Body(500.0),
-    foto: str = Body(None, example="https://link-da-foto.com/agressor.jpg"),
+    processo: str = Body(...), vitima: str = Body(...), telefone: str = Body(...),
+    validade: str = Body(..., description="DD/MM/AAAA"),
+    raio: float = Body(500.0), foto: str = Body(None),
     db: Session = Depends(get_db), token: str = Depends(verificar_token)
 ):
-    nova = MedidaProtetiva(
-        processo_id=processo, nome_vitima=vitima, telefone_vitima=telefone,
-        distancia_minima=raio, foto_agressor_url=foto, data_validade=validade
-    )
-    db.add(nova)
-    db.commit()
-    return {"status": "Proteção Cadastrada com Sucesso"}
+    nova = MedidaProtetiva(processo_id=processo, nome_vitima=vitima, telefone_vitima=telefone,
+                           distancia_minima=raio, foto_agressor_url=foto, data_validade=validade)
+    db.add(nova); db.commit()
+    return {"status": "Cadastro Realizado"}
 
 @app.post("/monitorar", tags=["Operacional"])
 async def monitorar_proximidade(
@@ -113,115 +105,96 @@ async def monitorar_proximidade(
     db: Session = Depends(get_db), token: str = Depends(verificar_token)
 ):
     medida = db.query(MedidaProtetiva).filter(MedidaProtetiva.processo_id == id_caso).first()
-    if not medida: raise HTTPException(status_code=404, detail="Processo inexistente")
+    if not medida: raise HTTPException(status_code=404, detail="Medida não encontrada")
 
-    # VALIDAÇÃO JURÍDICA AUTOMÁTICA
+    # VALIDAÇÃO JURÍDICA COM TRATAMENTO DE ERRO (Evita Erro 500)
     vigente = True
     try:
-        data_exp = datetime.strptime(medida.data_validade, "%d/%m/%Y")
-        if datetime.now() > data_exp: vigente = False
-    except: vigente = True # Se erro no formato, assume vigente por segurança
+        data_limpa = medida.data_validade.strip()
+        data_exp = datetime.strptime(data_limpa, "%d/%m/%Y")
+        if datetime.now().date() > data_exp.date():
+            vigente = False
+    except:
+        vigente = True # Assume vigente se houver erro de formato
 
     dist = geodesic((ag_lat, ag_long), (vi_lat, vi_long)).meters
     notif = "N/A"
-    status_msg = "SISTEMA SEGURO"
     
     if dist <= medida.distancia_minima:
-        status_msg = "🚨 ALERTA: VIOLAÇÃO DE PERÍMETRO! 🚨"
         maps = f"https://www.google.com/maps?q={ag_lat},{ag_long}"
+        notif = await disparar_alerta_urgente(medida.telefone_vitima, dist, medida.nome_vitima, maps, medida.foto_agressor_url, vigente)
         
-        # Disparo do Alerta Real com Foto e Localização
-        notif = await disparar_alerta_urgente(
-            medida.telefone_vitima, dist, medida.nome_vitima, maps, 
-            medida.foto_agressor_url, vigente
-        )
-        
-        # Registro no Histórico de Provas (Cadeia de Custódia)
-        log = HistoricoViolacao(
-            medida_id=medida.id, distancia_detectada=round(dist, 2),
-            lat_agressor=ag_lat, long_agressor=ag_long, 
-            status_notificacao=notif, medida_vigente_na_hora="SIM" if vigente else "NÃO"
-        )
+        log = HistoricoViolacao(medida_id=medida.id, distancia_detectada=round(dist, 2),
+                               lat_agressor=ag_lat, long_agressor=ag_long, 
+                               status_notificacao=notif, medida_vigente_na_hora="SIM" if vigente else "NÃO")
         db.add(log); db.commit()
 
     return {
-        "status": status_msg, 
-        "vigencia_juridica": "ATIVA" if vigente else "EXPIRADA",
-        "distancia_apurada": f"{round(dist, 2)}m",
-        "notificacao_central": notif
+        "status": "🚨 ALERTA" if dist <= medida.distancia_minima else "OK", 
+        "vigencia": "ATIVA" if vigente else "EXPIRADA",
+        "distancia": f"{round(dist, 2)}m"
     }
 
 @app.get("/relatorio-impressao/{processo_id}", response_class=HTMLResponse, tags=["Relatórios"])
 async def gerar_relatorio_visual(processo_id: str, db: Session = Depends(get_db)):
     medida = db.query(MedidaProtetiva).filter(MedidaProtetiva.processo_id == processo_id).first()
-    if not medida: return "<h1>Erro: Medida Protetiva não encontrada.</h1>"
+    if not medida: return "<h1>Processo não localizado</h1>"
     
-    # Checagem de vigência para o cabeçalho do relatório
+    # Checagem de vigência atual
     vigente_hoje = True
     try:
-        data_exp = datetime.strptime(medida.data_validade, "%d/%m/%Y")
-        if datetime.now() > data_exp: vigente_hoje = False
+        de = datetime.strptime(medida.data_validade.strip(), "%d/%m/%Y")
+        if datetime.now().date() > de.date(): vigente_hoje = False
     except: vigente_hoje = True
 
-    cor_status = "#28a745" if vigente_hoje else "#dc3545"
-    texto_status = "VIGENTE / ATIVA" if vigente_hoje else "EXPIRADA / VENCIDA"
+    status_txt = "VIGENTE" if vigente_hoje else "EXPIRADA"
+    cor = "#28a745" if vigente_hoje else "#dc3545"
 
     violacoes = db.query(HistoricoViolacao).filter(HistoricoViolacao.medida_id == medida.id).all()
     linhas = ""
-    geo = Nominatim(user_agent="sentinela_am_clodoaldo")
+    geo = Nominatim(user_agent="sentinela_am")
 
     for v in violacoes:
         try:
-            loc = geo.reverse(f"{v.lat_agressor}, {v.long_agressor}", timeout=3)
-            end = loc.address if loc else f"Coord: {v.lat_agressor}, {v.long_agressor}"
-        except: end = "Endereço registrado via GPS"
+            l = geo.reverse(f"{v.lat_agressor}, {v.long_agressor}", timeout=3)
+            end = l.address if l else "Localização via GPS"
+        except: end = "Endereço por coordenadas"
         
-        cor_v = "green" if v.medida_vigente_na_hora == "SIM" else "red"
-        
-        linhas += f"""
-        <tr>
-            <td>{v.timestamp.strftime('%d/%m/%Y %H:%M')}</td>
-            <td>{v.distancia_detectada}m</td>
-            <td style='font-size:12px;'>{end}</td>
-            <td style='color:{cor_v}; font-weight:bold;'>{v.medida_vigente_na_hora}</td>
-        </tr>
-        """
+        v_cor = "green" if v.medida_vigente_na_hora == "SIM" else "red"
+        linhas += f"<tr><td>{v.timestamp.strftime('%d/%m/%Y %H:%M')}</td><td>{v.distancia_detectada}m</td><td>{end}</td><td style='color:{v_cor}; font-weight:bold;'>{v.medida_vigente_na_hora}</td></tr>"
 
     return f"""
     <html>
     <head><style>
-        body {{ font-family: 'Segoe UI', Arial; padding: 40px; line-height: 1.6; }}
-        .header {{ border-bottom: 5px solid #003366; text-align: center; padding-bottom: 10px; }}
-        .badge {{ background: {cor_status}; color: white; padding: 8px 15px; border-radius: 20px; font-weight: bold; display: inline-block; margin-top: 10px; }}
-        .box {{ background: #f9f9f9; border: 1px solid #ddd; padding: 20px; margin: 20px 0; display: flex; border-radius: 8px; }}
-        .foto {{ width: 130px; height: 160px; border: 3px solid #003366; border-radius: 5px; object-fit: cover; margin-right: 25px; background: #eee; }}
+        body {{ font-family: sans-serif; padding: 40px; }}
+        .header {{ border-bottom: 4px solid #003366; text-align: center; }}
+        .badge {{ background: {cor}; color: white; padding: 10px; border-radius: 5px; display: inline-block; margin: 10px 0; font-weight: bold; }}
+        .box {{ background: #f8f9fa; padding: 20px; margin: 20px 0; border-radius: 10px; display: flex; align-items: center; border: 1px solid #ddd; }}
+        .foto {{ width: 120px; height: 150px; border: 3px solid #003366; border-radius: 5px; object-fit: cover; margin-right: 20px; }}
         table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
         th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
         th {{ background: #003366; color: white; }}
-        .footer {{ margin-top: 40px; font-size: 11px; text-align: center; color: #888; border-top: 1px solid #eee; padding-top: 10px; }}
-        @media print {{ .btn {{ display: none; }} }}
     </style></head>
     <body>
         <div class="header">
-            <h2>RELATÓRIO PERICIAL DE MONITORAMENTO ELETRÔNICO</h2>
-            <p>SISTEMA SENTINELA MULHER | ESTADO DO AMAZONAS</p>
-            <div class="badge">STATUS JURÍDICO: {texto_status}</div>
+            <h2>RELATÓRIO PERICIAL DE MONITORAMENTO</h2>
+            <p>SISTEMA SENTINELA MULHER | AMAZONAS</p>
+            <div class="badge">STATUS JURÍDICO: {status_txt}</div>
         </div>
         <div class="box">
-            <img src="{medida.foto_agressor_url or 'https://via.placeholder.com/150?text=AGRESSOR'}" class="foto">
+            <img src="{medida.foto_agressor_url or 'https://via.placeholder.com/150'}" class="foto">
             <div>
-                <p><b>Nº PROCESSO:</b> {medida.processo_id}</p>
-                <p><b>VÍTIMA:</b> {medida.nome_vitima}</p>
-                <p><b>VENCIMENTO DA MEDIDA:</b> {medida.data_validade}</p>
-                <p><b>DIRETRIZ POLICIAL:</b> { "EFETUAR PRISÃO EM CASO DE VIOLAÇÃO" if vigente_hoje else "VERIFICAR RENOVAÇÃO / INFORMAR JUDICIÁRIO" }</p>
+                <p><b>PROCESSO:</b> {medida.processo_id} | <b>VÍTIMA:</b> {medida.nome_vitima}</p>
+                <p><b>VALIDADE:</b> {medida.data_validade} | <b>VIOLAÇÕES:</b> {len(violacoes)}</p>
+                <p><b>AÇÃO:</b> { "EFETUAR PRISÃO" if vigente_hoje else "VERIFICAR RENOVAÇÃO" }</p>
             </div>
         </div>
         <table>
-            <thead><tr><th>Data/Hora</th><th>Distância</th><th>Localização da Invasão (Endereço)</th><th>Estava Vigente?</th></tr></thead>
-            <tbody>{linhas or "<tr><td colspan='4' style='text-align:center;'>Nenhuma violação detectada até o presente momento.</td></tr>"}</tbody>
+            <thead><tr><th>Data/Hora</th><th>Distância</th><th>Localização da Invasão</th><th>Vigente na Hora?</th></tr></thead>
+            <tbody>{linhas or "<tr><td colspan='4'>Sem registros</td></tr>"}</tbody>
         </table>
-        <div class="footer">Relatório extraído por Investigador Clodoaldo S. Viana - Data: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</div>
-        <br><button class="btn" onclick="window.print()" style="padding:10px 20px; background:#003366; color:white; border:none; border-radius:5px; cursor:pointer;">Gerar PDF / Imprimir</button>
+        <p style="text-align:center; color:#888; font-size:12px; margin-top:30px;">Gerado por Investigador Clodoaldo S. Viana</p>
+        <br><button onclick="window.print()">Salvar em PDF</button>
     </body></html>
     """
 

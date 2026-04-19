@@ -10,7 +10,6 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from geopy.distance import geodesic
-from geopy.geocoders import Nominatim
 import uvicorn
 
 # --- CONFIGURAÇÃO DE TIMEZONE ---
@@ -46,12 +45,8 @@ class HistoricoViolacao(Base):
 Base.metadata.create_all(bind=engine)
 
 # --- SEGURANÇA OAUTH2 ---
-app = FastAPI(title="Sentinela Mulher - Amazonas (Seguro)")
+app = FastAPI(title="Sentinela Mulher - Amazonas")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-# Usuário e Senha para a Demonstração
-USER_ADMIN = "admin"
-PASS_ADMIN = "senha123"
 
 def get_db():
     db = SessionLocal()
@@ -60,28 +55,28 @@ def get_db():
 
 @app.post("/token", tags=["Segurança"])
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    if form_data.username == USER_ADMIN and form_data.password == PASS_ADMIN:
+    if form_data.username == "admin" and form_data.password == "senha123":
         return {"access_token": "chave_secreta_policial_2026", "token_type": "bearer"}
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciais inválidas")
 
 def verificar_token(token: str = Depends(oauth2_scheme)):
     if token != "chave_secreta_policial_2026":
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido ou expirado")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
     return token
 
 # --- LÓGICA DE NEGÓCIO ---
 WEBHOOK_URL = "https://webhook.site/01357d1f-0b8a-4527-884f-41579b128943"
 
 async def disparar_alerta_urgente(telefone, distancia, vitima, maps_url, foto_url, vigente):
-    status_juridico = "VIGENTE - AUTORIZA PRISÃO" if vigente else "EXPIRADA - MONITORAMENTO INFORMATIVO"
+    status_juridico = "VIGENTE" if vigente else "EXPIRADA"
     payload = {
         "timestamp": datetime.now(tz_am).strftime("%d/%m/%Y %H:%M:%S"),
-        "evento": "ALERTA SENTINELA: VIOLAÇÃO",
-        "status_juridico": status_juridico,
+        "evento": "VIOLAÇÃO DETECTADA",
+        "status": status_juridico,
         "vitima": vitima,
         "distancia": f"{round(distancia, 2)}m",
         "mapa": maps_url,
-        "foto": foto_url or "https://via.placeholder.com/150"
+        "foto_agressor": foto_url
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
         try: await client.post(WEBHOOK_URL, json=payload)
@@ -95,7 +90,7 @@ def verificar_vigencia(data_str: str) -> bool:
         return agora <= data_exp_final
     except: return True
 
-# --- ENDPOINTS PROTEGIDOS ---
+# --- ENDPOINTS ---
 
 @app.post("/cadastrar-medida", tags=["Administrativo"])
 async def cadastrar_medida(
@@ -106,7 +101,7 @@ async def cadastrar_medida(
     nova = MedidaProtetiva(processo_id=processo.strip(), nome_vitima=vitima, telefone_vitima=telefone,
                            distancia_minima=raio, foto_agressor_url=foto, data_validade=validade)
     db.add(nova); db.commit()
-    return {"status": "Segurança ativada para este processo"}
+    return {"status": "Processo Cadastrado com Sucesso"}
 
 @app.post("/monitorar", tags=["Operacional"])
 async def monitorar_proximidade(
@@ -115,56 +110,111 @@ async def monitorar_proximidade(
     db: Session = Depends(get_db), token: str = Depends(verificar_token)
 ):
     medida = db.query(MedidaProtetiva).filter(MedidaProtetiva.processo_id == id_caso.strip()).first()
-    if not medida: raise HTTPException(status_code=404, detail="Processo não cadastrado")
+    if not medida: raise HTTPException(status_code=404, detail="Não cadastrado")
 
     vigente = verificar_vigencia(medida.data_validade)
     dist = geodesic((ag_lat, ag_long), (vi_lat, vi_long)).meters
     
     if dist <= medida.distancia_minima:
-        maps = f"https://www.google.com/maps?q={ag_lat},{ag_long}"
+        maps = f"http://maps.google.com/?q={ag_lat},{ag_long}"
         await disparar_alerta_urgente(medida.telefone_vitima, dist, medida.nome_vitima, maps, medida.foto_agressor_url, vigente)
         
         log = HistoricoViolacao(medida_id=medida.id, distancia_detectada=round(dist, 2),
                                lat_agressor=ag_lat, long_agressor=ag_long, 
-                               status_notificacao="Alerta Enviado", medida_vigente_na_hora="SIM" if vigente else "NÃO")
+                               status_notificacao="Enviado", medida_vigente_na_hora="SIM" if vigente else "NÃO")
         db.add(log); db.commit()
 
     return {
-        "alerta": dist <= medida.distancia_minima,
+        "violacao": dist <= medida.distancia_minima,
         "vigencia": "ATIVA" if vigente else "EXPIRADA",
         "distancia": f"{round(dist, 2)}m",
-        "vitima": medida.nome_vitima,
-        "agressor_foto": medida.foto_agressor_url
+        "agressor": {"foto": medida.foto_agressor_url},
+        "vitima": {"nome": medida.nome_vitima}
     }
 
 @app.get("/relatorio-impressao/{processo_id}", response_class=HTMLResponse, tags=["Relatórios"])
 async def gerar_relatorio_visual(processo_id: str, db: Session = Depends(get_db)):
-    # Nota: Este endpoint é visual para impressão. 
-    # Em produção, ele também deveria validar o token via Cookie ou Query,
-    # mas para sua apresentação, deixaremos acessível via link direto do ID.
     medida = db.query(MedidaProtetiva).filter(MedidaProtetiva.processo_id == processo_id.strip()).first()
-    if not medida: return "<h1>Acesso Negado ou Processo Inexistente</h1>"
+    if not medida: return "<h1>Processo Inexistente</h1>"
     
     vigente_hoje = verificar_vigencia(medida.data_validade)
+    cor_status = "#28a745" if vigente_hoje else "#dc3545"
     violacoes = db.query(HistoricoViolacao).filter(HistoricoViolacao.medida_id == medida.id).all()
     
     linhas = ""
     for v in violacoes:
         v_cor = "green" if v.medida_vigente_na_hora == "SIM" else "red"
-        linhas += f"<tr><td>{v.timestamp.strftime('%d/%m/%Y %H:%M')}</td><td>{v.distancia_detectada}m</td><td>{v.lat_agressor}, {v.long_agressor}</td><td style='color:{v_cor};'>{v.medida_vigente_na_hora}</td></tr>"
+        linhas += f"<tr><td>{v.timestamp.strftime('%d/%m/%Y %H:%M')}</td><td>{v.distancia_detectada}m</td><td>{v.lat_agressor}, {v.long_agressor}</td><td style='color:{v_cor}; font-weight:bold;'>{v.medida_vigente_na_hora}</td></tr>"
 
     return f"""
-    <html><body style="font-family:sans-serif; padding:30px;">
-        <h2 style="color:#003366;">RELATÓRIO RESTRITO - SENTINELA MULHER</h2>
-        <hr>
-        <p><b>STATUS JURÍDICO:</b> {'VIGENTE' if vigente_hoje else 'EXPIRADO'}</p>
-        <p><b>VÍTIMA:</b> {medida.nome_vitima} | <b>PROCESSO:</b> {medida.processo_id}</p>
-        <table border="1" width="100%" style="border-collapse:collapse;">
-            <tr style="background:#eee;"><th>Data</th><th>Distância</th><th>Localização</th><th>Vigente?</th></tr>
-            {linhas or "<tr><td colspan='4' align='center'>Sem ocorrências</td></tr>"}
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <style>
+            body {{ font-family: 'Segoe UI', Arial, sans-serif; padding: 40px; color: #333; }}
+            .header {{ text-align: center; border-bottom: 5px solid #003366; padding-bottom: 10px; margin-bottom: 20px; }}
+            .status-badge {{ background: {cor_status}; color: white; padding: 8px 15px; border-radius: 20px; font-weight: bold; display: inline-block; }}
+            .container {{ display: flex; border: 1px solid #ddd; padding: 20px; background: #fdfdfd; border-radius: 8px; }}
+            .foto-container {{ text-align: center; margin-right: 30px; }}
+            .foto-agressor {{ width: 160px; height: 200px; border: 4px solid #003366; border-radius: 4px; object-fit: cover; background: #eee; display: block; }}
+            .label-foto {{ margin-top: 5px; font-size: 10px; font-weight: bold; color: #003366; text-transform: uppercase; }}
+            .info {{ flex-grow: 1; }}
+            .info h3 {{ margin: 0 0 10px 0; color: #003366; border-bottom: 1px solid #eee; }}
+            .info p {{ margin: 5px 0; font-size: 14px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 30px; }}
+            th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; font-size: 13px; }}
+            th {{ background: #003366; color: white; }}
+            tr:nth-child(even) {{ background-color: #f2f2f2; }}
+            .footer {{ margin-top: 50px; text-align: center; font-size: 11px; color: #777; border-top: 1px solid #eee; padding-top: 10px; }}
+            @media print {{ .no-print {{ display: none; }} }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h2 style="margin:0;">SISTEMA SENTINELA MULHER</h2>
+            <p style="margin:5px 0; font-size: 12px;">SECRETARIA DE SEGURANÇA PÚBLICA - ESTADO DO AMAZONAS</p>
+            <div class="status-badge">STATUS JURÍDICO: {'VIGENTE' if vigente_hoje else 'EXPIRADO'}</div>
+        </div>
+
+        <div class="container">
+            <div class="foto-container">
+                <img src="{medida.foto_agressor_url or 'https://via.placeholder.com/160x200?text=SEM+FOTO'}" 
+                     alt="Foto do Agressor" class="foto-agressor" onerror="this.src='https://via.placeholder.com/160x200?text=ERRO+NA+IMAGEM'">
+                <div class="label-foto">Identificação do Agressor</div>
+            </div>
+            <div class="info">
+                <h3>Dados do Monitoramento</h3>
+                <p><b>Número do Processo:</b> {medida.processo_id}</p>
+                <p><b>Vítima Protegida:</b> {medida.nome_vitima}</p>
+                <p><b>Data Limite da Medida:</b> {medida.data_validade}</p>
+                <p><b>Raio de Exclusão:</b> {medida.distancia_minima} metros</p>
+                <p><b>Instrução Policial:</b> { "EFETUAR PRISÃO EM CASO DE VIOLAÇÃO" if vigente_hoje else "VERIFICAR RENOVAÇÃO / MONITORAMENTO INFORMATIVO" }</p>
+            </div>
+        </div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Data/Hora (Manaus)</th>
+                    <th>Distância Detectada</th>
+                    <th>Coordenadas GPS</th>
+                    <th>Vigência Legal?</th>
+                </tr>
+            </thead>
+            <tbody>
+                {linhas or "<tr><td colspan='4' align='center'>Nenhum registro de violação encontrado.</td></tr>"}
+            </tbody>
         </table>
-        <br><button onclick="window.print()">Imprimir PDF Oficial</button>
-    </body></html>
+
+        <div class="footer">
+            Relatório Gerado por Investigador Clodoaldo S. Viana - Data: {datetime.now(tz_am).strftime('%d/%m/%Y %H:%M:%S')}
+        </div>
+        
+        <div style="text-align:center; margin-top: 20px;" class="no-print">
+            <button onclick="window.print()" style="padding:10px 20px; background:#003366; color:white; border:none; border-radius:5px; cursor:pointer; font-weight:bold;">Imprimir / Salvar PDF</button>
+        </div>
+    </body>
+    </html>
     """
 
 if __name__ == "__main__":
